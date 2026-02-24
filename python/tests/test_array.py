@@ -2068,6 +2068,12 @@ class TestArray(mlx_tests.MLXTestCase):
         a[mask] = 5.0
         self.assertTrue(mx.array_equal(a, expected))
 
+        # scalar target with scalar mask
+        a = mx.array(3.0)
+        mask = mx.array(True)
+        a[mask] = 5.0
+        self.assertEqual(a.item(), 5.0)
+
         mask_np = np.zeros((1, 10, 10), dtype=bool)
         with self.assertRaises(ValueError):
             mx.arange(1000).reshape(10, 10, 10)[mask_np] = 0

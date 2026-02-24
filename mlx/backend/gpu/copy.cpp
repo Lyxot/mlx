@@ -51,6 +51,11 @@ array flatten_in_eval(const array& x, int start_axis, int end_axis, Stream s) {
   start_axis = std::max(0, start_axis);
   end_axis = std::min(ndim - 1, end_axis);
 
+  // Flattening an empty axis range is a no-op
+  if (start_axis > end_axis) {
+    return x;
+  }
+
   return reshape_in_eval(x, Flatten::output_shape(x, start_axis, end_axis), s);
 }
 
