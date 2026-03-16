@@ -319,9 +319,8 @@ __global__ void strided_scan(
 }
 
 template <typename T, typename U, typename Op, int N_READS, bool reverse>
-__global__ void contiguous_scan_tile(
+__global__ void reduce_tile(
     const T* in,
-    U* out,
     U* tile_aggs,
     int32_t axis_size,
     int32_t tile_size,
@@ -345,6 +344,83 @@ __global__ void contiguous_scan_tile(
   }
 
   const T* tile_in = in + scan_id * axis_size + tile_start;
+
+  __shared__ U warp_sums[WARP_SIZE];
+
+  Op op;
+  U init = ReduceInit<Op, T>::value();
+
+  // Load values and reduce per thread.
+  int32_t index = block.thread_rank();
+  U values[N_READS];
+  load_values<reverse>(index, tile_in, values, tile_len, init);
+
+  // Thread-local reduction.
+  U thread_sum = values[0];
+  for (int i = 1; i < N_READS; ++i) {
+    thread_sum = op(thread_sum, values[i]);
+  }
+
+  // Warp-level reduction.
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    thread_sum = op(thread_sum, warp.shfl_down(thread_sum, offset));
+  }
+
+  // Write warp sum to shared memory.
+  if (warp.thread_rank() == 0) {
+    warp_sums[warp.meta_group_rank()] = thread_sum;
+  }
+  block.sync();
+
+  // Final reduction across warps.
+  if (warp.meta_group_rank() == 0) {
+    int num_warps = block.size() / WARP_SIZE;
+    U val =
+        (warp.thread_rank() < num_warps) ? warp_sums[warp.thread_rank()] : init;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+      val = op(val, warp.shfl_down(val, offset));
+    }
+    if (warp.thread_rank() == 0) {
+      tile_aggs[scan_id * num_tiles + tile_id] = val;
+    }
+  }
+}
+
+template <
+    typename T,
+    typename U,
+    typename Op,
+    int N_READS,
+    bool inclusive,
+    bool reverse>
+__global__ void scan_tile_with_prefix(
+    const T* in,
+    U* out,
+    const U* tile_prefixes,
+    int32_t axis_size,
+    int32_t tile_size,
+    int32_t num_tiles) {
+  auto grid = cg::this_grid();
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<WARP_SIZE>(block);
+
+  int scan_id = grid.block_rank() / num_tiles;
+  int tile_id = grid.block_rank() % num_tiles;
+
+  U prefix = tile_prefixes[scan_id * num_tiles + tile_id];
+
+  // Compute tile boundaries.
+  int32_t tile_start, tile_len;
+  if constexpr (reverse) {
+    int32_t tile_end = axis_size - tile_id * tile_size;
+    tile_start = (tile_end > tile_size) ? (tile_end - tile_size) : 0;
+    tile_len = tile_end - tile_start;
+  } else {
+    tile_start = tile_id * tile_size;
+    tile_len = min(tile_size, axis_size - tile_start);
+  }
+
+  const T* tile_in = in + scan_id * axis_size + tile_start;
   U* tile_out = out + scan_id * axis_size + tile_start;
 
   __shared__ U warp_sums[WARP_SIZE];
@@ -352,7 +428,7 @@ __global__ void contiguous_scan_tile(
   Op op;
   U init = ReduceInit<Op, T>::value();
 
-  // Load values for this tile.
+  // Load values from input.
   int32_t index = block.thread_rank();
   U values[N_READS];
   load_values<reverse>(index, tile_in, values, tile_len, init);
@@ -386,133 +462,26 @@ __global__ void contiguous_scan_tile(
   }
   block.sync();
 
-  // Compute inclusive scan output.
+  // Compute inclusive scan with tile prefix.
   for (int i = 0; i < N_READS; ++i) {
+    values[i] = op(values[i], prefix);
     values[i] = op(values[i], warp_sums[warp.meta_group_rank()]);
     values[i] = op(values[i], prev_thread_sum);
   }
 
-  // Write inclusive scan values.
-  store_values<reverse, 0>(index, tile_out, values, tile_len);
-
-  // Write tile aggregate (last thread has the full aggregate).
-  if (block.thread_rank() == block.size() - 1) {
-    tile_aggs[scan_id * num_tiles + tile_id] = values[N_READS - 1];
-  }
-}
-
-template <typename U, typename Op, int N_READS, bool inclusive, bool reverse>
-__global__ void propagate_prefix(
-    U* out,
-    const U* tile_prefixes,
-    int32_t axis_size,
-    int32_t tile_size,
-    int32_t num_tiles) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
-  auto warp = cg::tiled_partition<WARP_SIZE>(block);
-
-  int scan_id = grid.block_rank() / num_tiles;
-  int tile_id = grid.block_rank() % num_tiles;
-
-  U prefix = tile_prefixes[scan_id * num_tiles + tile_id];
-
-  Op op;
-  U init = ReduceInit<Op, U>::value();
-
-  // Compute tile boundaries.
-  int32_t tile_start, tile_len;
-  if constexpr (reverse) {
-    int32_t tile_end = axis_size - tile_id * tile_size;
-    tile_start = (tile_end > tile_size) ? (tile_end - tile_size) : 0;
-    tile_len = tile_end - tile_start;
-  } else {
-    tile_start = tile_id * tile_size;
-    tile_len = min(tile_size, axis_size - tile_start);
-  }
-
-  U* tile_out = out + scan_id * axis_size + tile_start;
-  int idx = block.thread_rank() * N_READS;
-
+  // Write output.
   if constexpr (inclusive) {
-    // Simply add prefix to each element.
-    if (idx + N_READS <= tile_len) {
-      for (int i = 0; i < N_READS; ++i) {
-        tile_out[idx + i] = op(tile_out[idx + i], prefix);
-      }
-    } else {
-      for (int i = 0; i < N_READS; ++i) {
-        if (idx + i < tile_len) {
-          tile_out[idx + i] = op(tile_out[idx + i], prefix);
-        }
-      }
-    }
+    store_values<reverse, 0>(index, tile_out, values, tile_len);
   } else {
-    // Exclusive: read inclusive values, shift by 1, then add prefix.
-    __shared__ U warp_boundary[WARP_SIZE];
-
-    // Read inclusive scan values from Phase 1.
-    U values[N_READS];
-    for (int i = 0; i < N_READS; ++i) {
-      values[i] = (idx + i < tile_len) ? tile_out[idx + i] : init;
-    }
-
-    if constexpr (!reverse) {
-      // Forward exclusive: shift right.
-      U my_last = values[N_READS - 1];
-      U prev = warp.shfl_up(my_last, 1);
-
-      if (warp.thread_rank() == WARP_SIZE - 1) {
-        warp_boundary[warp.meta_group_rank()] = my_last;
+    store_values<reverse, 1>(index, tile_out, values, tile_len);
+    // Write identity at the scan boundary.
+    if constexpr (reverse) {
+      if (tile_id == 0 && block.thread_rank() == 0) {
+        tile_out[tile_len - 1] = ReduceInit<Op, U>::value();
       }
-      block.sync();
-
-      if (warp.thread_rank() == 0) {
-        if (warp.meta_group_rank() == 0) {
-          prev = init;
-        } else {
-          prev = warp_boundary[warp.meta_group_rank() - 1];
-        }
-      }
-
-      for (int i = N_READS - 1; i > 0; --i) {
-        values[i] = values[i - 1];
-      }
-      values[0] = prev;
     } else {
-      // Reverse exclusive: shift left.
-      U my_first = values[0];
-      U next = warp.shfl_down(my_first, 1);
-
-      if (warp.thread_rank() == 0) {
-        warp_boundary[warp.meta_group_rank()] = my_first;
-      }
-      block.sync();
-
-      if (warp.thread_rank() == WARP_SIZE - 1) {
-        int num_warps = block.size() / WARP_SIZE;
-        if (warp.meta_group_rank() == num_warps - 1) {
-          next = init;
-        } else {
-          next = warp_boundary[warp.meta_group_rank() + 1];
-        }
-      }
-
-      for (int i = 0; i < N_READS - 1; ++i) {
-        values[i] = values[i + 1];
-      }
-      values[N_READS - 1] = next;
-    }
-
-    // Add prefix to all values.
-    for (int i = 0; i < N_READS; ++i) {
-      values[i] = op(values[i], prefix);
-    }
-
-    // Write back.
-    for (int i = 0; i < N_READS; ++i) {
-      if (idx + i < tile_len) {
-        tile_out[idx + i] = values[i];
+      if (tile_id == 0 && block.thread_rank() == 0) {
+        tile_out[0] = ReduceInit<Op, U>::value();
       }
     }
   }
@@ -626,18 +595,16 @@ void scan_gpu_inplace(
                 tile_aggs.set_data(cu::malloc_async(agg_bytes, encoder));
                 encoder.add_temporary(tile_aggs);
 
-                // Inclusive scan within each tile.
-                auto tile_kernel = cu::
-                    contiguous_scan_tile<T, U, Op, N_READS, reverse_tag.value>;
+                // Reduce each tile to a single aggregate.
+                auto reduce_kernel =
+                    cu::reduce_tile<T, U, Op, N_READS, reverse_tag.value>;
                 encoder.set_input_array(in);
-                encoder.set_output_array(out);
                 encoder.set_output_array(tile_aggs);
                 encoder.add_kernel_node(
-                    tile_kernel,
+                    reduce_kernel,
                     num_scans * num_tiles,
                     block_dim,
                     gpu_ptr<T>(in),
-                    gpu_ptr<U>(out),
                     gpu_ptr<U>(tile_aggs),
                     axis_size,
                     tile_size,
@@ -665,20 +632,22 @@ void scan_gpu_inplace(
                     gpu_ptr<U>(tile_aggs),
                     num_tiles);
 
-                // Propagate prefix to each tile.
-                auto prop_kernel = cu::propagate_prefix<
+                // Scan each tile from input with prefix, write output.
+                auto scan_kernel = cu::scan_tile_with_prefix<
+                    T,
                     U,
                     Op,
                     N_READS,
                     inclusive_tag.value,
                     reverse_tag.value>;
+                encoder.set_input_array(in);
                 encoder.set_input_array(tile_aggs);
-                encoder.set_input_array(out);
                 encoder.set_output_array(out);
                 encoder.add_kernel_node(
-                    prop_kernel,
+                    scan_kernel,
                     num_scans * num_tiles,
                     block_dim,
+                    gpu_ptr<T>(in),
                     gpu_ptr<U>(out),
                     gpu_ptr<U>(tile_aggs),
                     axis_size,
