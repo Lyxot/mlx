@@ -318,7 +318,7 @@ __global__ void strided_scan(
   }
 }
 
-template <typename T, typename U, typename Op, int N_READS, bool reverse>
+template <typename T, typename U, typename Op, int N_READS>
 __global__ void reduce_tile(
     const T* in,
     U* tile_aggs,
@@ -332,57 +332,58 @@ __global__ void reduce_tile(
   int scan_id = grid.block_rank() / num_tiles;
   int tile_id = grid.block_rank() % num_tiles;
 
-  // Compute tile boundaries.
-  int32_t tile_start, tile_len;
-  if constexpr (reverse) {
-    int32_t tile_end = axis_size - tile_id * tile_size;
-    tile_start = (tile_end > tile_size) ? (tile_end - tile_size) : 0;
-    tile_len = tile_end - tile_start;
-  } else {
-    tile_start = tile_id * tile_size;
-    tile_len = min(tile_size, axis_size - tile_start);
-  }
+  int32_t tile_start = tile_id * tile_size;
+  int32_t tile_len = min(tile_size, axis_size - tile_start);
 
+  // All scan ops are commutative, so reduction order is irrelevant and
+  // we always read forward regardless of the scan direction.
   const T* tile_in = in + scan_id * axis_size + tile_start;
 
   __shared__ U warp_sums[WARP_SIZE];
 
   Op op;
   U init = ReduceInit<Op, T>::value();
+  U tile_total = init;
 
-  // Load values and reduce per thread.
-  int32_t index = block.thread_rank();
-  U values[N_READS];
-  load_values<reverse>(index, tile_in, values, tile_len, init);
+  int32_t elems_per_pass = block.size() * N_READS;
+  for (int r = 0; r < cuda::ceil_div(tile_len, elems_per_pass); ++r) {
+    int32_t index = r * block.size() + block.thread_rank();
+    U values[N_READS];
+    load_values<false>(index, tile_in, values, tile_len, init);
 
-  // Thread-local reduction.
-  U thread_sum = values[0];
-  for (int i = 1; i < N_READS; ++i) {
-    thread_sum = op(thread_sum, values[i]);
-  }
+    // Thread-local reduction.
+    U thread_sum = values[0];
+    for (int i = 1; i < N_READS; ++i) {
+      thread_sum = op(thread_sum, values[i]);
+    }
 
-  // Warp-level reduction.
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-    thread_sum = op(thread_sum, warp.shfl_down(thread_sum, offset));
-  }
-
-  // Write warp sum to shared memory.
-  if (warp.thread_rank() == 0) {
-    warp_sums[warp.meta_group_rank()] = thread_sum;
-  }
-  block.sync();
-
-  // Final reduction across warps.
-  if (warp.meta_group_rank() == 0) {
-    int num_warps = block.size() / WARP_SIZE;
-    U val =
-        (warp.thread_rank() < num_warps) ? warp_sums[warp.thread_rank()] : init;
+    // Warp-level reduction.
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-      val = op(val, warp.shfl_down(val, offset));
+      thread_sum = op(thread_sum, warp.shfl_down(thread_sum, offset));
     }
+
     if (warp.thread_rank() == 0) {
-      tile_aggs[scan_id * num_tiles + tile_id] = val;
+      warp_sums[warp.meta_group_rank()] = thread_sum;
     }
+    block.sync();
+
+    // Block-level reduction.
+    if (warp.meta_group_rank() == 0) {
+      int num_warps = block.size() / WARP_SIZE;
+      U val = (warp.thread_rank() < num_warps) ? warp_sums[warp.thread_rank()]
+                                               : init;
+      for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val = op(val, warp.shfl_down(val, offset));
+      }
+      if (warp.thread_rank() == 0) {
+        tile_total = op(tile_total, val);
+      }
+    }
+    block.sync();
+  }
+
+  if (block.thread_rank() == 0) {
+    tile_aggs[scan_id * num_tiles + tile_id] = tile_total;
   }
 }
 
@@ -407,8 +408,6 @@ __global__ void scan_tile_with_prefix(
   int scan_id = grid.block_rank() / num_tiles;
   int tile_id = grid.block_rank() % num_tiles;
 
-  U prefix = tile_prefixes[scan_id * num_tiles + tile_id];
-
   // Compute tile boundaries.
   int32_t tile_start, tile_len;
   if constexpr (reverse) {
@@ -427,63 +426,76 @@ __global__ void scan_tile_with_prefix(
 
   Op op;
   U init = ReduceInit<Op, T>::value();
+  U prefix = tile_prefixes[scan_id * num_tiles + tile_id];
 
-  // Load values from input.
-  int32_t index = block.thread_rank();
-  U values[N_READS];
-  load_values<reverse>(index, tile_in, values, tile_len, init);
+  int32_t elems_per_pass = block.size() * N_READS;
+  for (int r = 0; r < cuda::ceil_div(tile_len, elems_per_pass); ++r) {
+    int32_t index = r * block.size() + block.thread_rank();
+    U values[N_READS];
+    load_values<reverse>(index, tile_in, values, tile_len, init);
 
-  // Inclusive scan per thread.
-  for (int i = 1; i < N_READS; ++i) {
-    values[i] = op(values[i], values[i - 1]);
-  }
+    // Inclusive scan per thread.
+    for (int i = 1; i < N_READS; ++i) {
+      values[i] = op(values[i], values[i - 1]);
+    }
 
-  // Exclusive scan of thread sums within warp.
-  U prev_thread_sum = cg::exclusive_scan(warp, values[N_READS - 1], op);
-  if (warp.thread_rank() == 0) {
-    prev_thread_sum = init;
-  }
-
-  // Write warp sum to shared memory.
-  if (warp.thread_rank() == WARP_SIZE - 1) {
-    warp_sums[warp.meta_group_rank()] =
-        op(prev_thread_sum, values[N_READS - 1]);
-  }
-  block.sync();
-
-  // Exclusive scan of warp sums.
-  if (warp.meta_group_rank() == 0) {
-    U prev_warp_sum =
-        cg::exclusive_scan(warp, warp_sums[warp.thread_rank()], op);
+    // Exclusive scan of thread sums within warp.
+    U prev_thread_sum = cg::exclusive_scan(warp, values[N_READS - 1], op);
     if (warp.thread_rank() == 0) {
-      prev_warp_sum = init;
+      prev_thread_sum = init;
     }
-    warp_sums[warp.thread_rank()] = prev_warp_sum;
-  }
-  block.sync();
 
-  // Compute inclusive scan with tile prefix.
-  for (int i = 0; i < N_READS; ++i) {
-    values[i] = op(values[i], prefix);
-    values[i] = op(values[i], warp_sums[warp.meta_group_rank()]);
-    values[i] = op(values[i], prev_thread_sum);
-  }
+    // Write warp sum to shared memory.
+    if (warp.thread_rank() == WARP_SIZE - 1) {
+      warp_sums[warp.meta_group_rank()] =
+          op(prev_thread_sum, values[N_READS - 1]);
+    }
+    block.sync();
 
-  // Write output.
-  if constexpr (inclusive) {
-    store_values<reverse, 0>(index, tile_out, values, tile_len);
-  } else {
-    store_values<reverse, 1>(index, tile_out, values, tile_len);
-    // Write identity at the scan boundary.
-    if constexpr (reverse) {
-      if (tile_id == 0 && block.thread_rank() == 0) {
-        tile_out[tile_len - 1] = ReduceInit<Op, U>::value();
+    // Exclusive scan of warp sums.
+    if (warp.meta_group_rank() == 0) {
+      U prev_warp_sum =
+          cg::exclusive_scan(warp, warp_sums[warp.thread_rank()], op);
+      if (warp.thread_rank() == 0) {
+        prev_warp_sum = init;
       }
+      warp_sums[warp.thread_rank()] = prev_warp_sum;
+    }
+    block.sync();
+
+    // Compute inclusive scan with running prefix.
+    for (int i = 0; i < N_READS; ++i) {
+      values[i] = op(values[i], prefix);
+      values[i] = op(values[i], warp_sums[warp.meta_group_rank()]);
+      values[i] = op(values[i], prev_thread_sum);
+    }
+
+    // Write output.
+    if constexpr (inclusive) {
+      store_values<reverse, 0>(index, tile_out, values, tile_len);
     } else {
-      if (tile_id == 0 && block.thread_rank() == 0) {
-        tile_out[0] = ReduceInit<Op, U>::value();
+      store_values<reverse, 1>(index, tile_out, values, tile_len);
+      if (r == 0) {
+        if constexpr (reverse) {
+          if (tile_id == 0 && block.thread_rank() == 0) {
+            tile_out[tile_len - 1] = ReduceInit<Op, U>::value();
+          }
+        } else {
+          if (tile_id == 0 && block.thread_rank() == 0) {
+            tile_out[0] = prefix;
+          }
+        }
       }
     }
+    block.sync();
+
+    // Carry prefix to next pass.
+    if ((warp.meta_group_rank() == warp.meta_group_size() - 1) &&
+        (warp.thread_rank() == WARP_SIZE - 1)) {
+      warp_sums[0] = values[N_READS - 1];
+    }
+    block.sync();
+    prefix = warp_sums[0];
   }
 }
 
@@ -554,17 +566,22 @@ void scan_gpu_inplace(
         dispatch_bool(inclusive, [&](auto inclusive_tag) {
           dispatch_bool(reverse, [&](auto reverse_tag) {
             if (contiguous) {
+              constexpr int BLOCK_DIM = WARP_SIZE * WARP_SIZE;
               int block_dim = cuda::ceil_div(axis_size, N_READS);
               block_dim = cuda::ceil_div(block_dim, WARP_SIZE) * WARP_SIZE;
-              block_dim = std::min(block_dim, WARP_SIZE * WARP_SIZE);
-              int tile_size = block_dim * N_READS;
-
-              int num_tiles = cuda::ceil_div(axis_size, tile_size);
+              block_dim = std::min(block_dim, BLOCK_DIM);
               int num_scans = static_cast<int>(in.data_size() / axis_size);
+              int elems_per_pass = block_dim * N_READS;
 
-              // Use multi-block only when there is a single scan instance with
-              // a large axis.
-              bool use_multi_block = num_scans == 1 && num_tiles >= 16;
+              // Use multi-block only when there is a single scan
+              // instance with a large axis.
+              constexpr int TARGET_TILES = 64;
+              int passes_per_tile = std::max(
+                  1, cuda::ceil_div(axis_size / TARGET_TILES, elems_per_pass));
+              int tile_size = passes_per_tile * elems_per_pass;
+              int num_tiles = cuda::ceil_div(axis_size, tile_size);
+              bool use_multi_block =
+                  num_scans == 1 && num_tiles >= TARGET_TILES;
 
               if (!use_multi_block) {
                 auto kernel = cu::contiguous_scan<
@@ -596,8 +613,7 @@ void scan_gpu_inplace(
                 encoder.add_temporary(tile_aggs);
 
                 // Reduce each tile to a single aggregate.
-                auto reduce_kernel =
-                    cu::reduce_tile<T, U, Op, N_READS, reverse_tag.value>;
+                auto reduce_kernel = cu::reduce_tile<T, U, Op, N_READS>;
                 encoder.set_input_array(in);
                 encoder.set_output_array(tile_aggs);
                 encoder.add_kernel_node(
@@ -611,6 +627,7 @@ void scan_gpu_inplace(
                     num_tiles);
 
                 // Exclusive forward scan of tile aggregates.
+                // Reuse contiguous_scan with T=U, exclusive, forward.
                 auto agg_kernel = cu::contiguous_scan<
                     U,
                     U,
