@@ -408,16 +408,10 @@ __global__ void scan_tile_with_prefix(
   int scan_id = grid.block_rank() / num_tiles;
   int tile_id = grid.block_rank() % num_tiles;
 
-  // Compute tile boundaries.
-  int32_t tile_start, tile_len;
-  if constexpr (reverse) {
-    int32_t tile_end = axis_size - tile_id * tile_size;
-    tile_start = (tile_end > tile_size) ? (tile_end - tile_size) : 0;
-    tile_len = tile_end - tile_start;
-  } else {
-    tile_start = tile_id * tile_size;
-    tile_len = min(tile_size, axis_size - tile_start);
-  }
+  // Tile boundaries always use forward layout (matching reduce_tile).
+  // load_values<reverse> handles within-tile reversal.
+  int32_t tile_start = tile_id * tile_size;
+  int32_t tile_len = min(tile_size, axis_size - tile_start);
 
   const T* tile_in = in + scan_id * axis_size + tile_start;
   U* tile_out = out + scan_id * axis_size + tile_start;
@@ -475,15 +469,11 @@ __global__ void scan_tile_with_prefix(
       store_values<reverse, 0>(index, tile_out, values, tile_len);
     } else {
       store_values<reverse, 1>(index, tile_out, values, tile_len);
-      if (r == 0) {
+      if (r == 0 && block.thread_rank() == 0) {
         if constexpr (reverse) {
-          if (tile_id == 0 && block.thread_rank() == 0) {
-            tile_out[tile_len - 1] = ReduceInit<Op, U>::value();
-          }
+          tile_out[tile_len - 1] = prefix;
         } else {
-          if (tile_id == 0 && block.thread_rank() == 0) {
-            tile_out[0] = prefix;
-          }
+          tile_out[0] = prefix;
         }
       }
     }
@@ -634,7 +624,7 @@ void scan_gpu_inplace(
                     Op,
                     N_READS,
                     false /* exclusive */,
-                    false /* forward */>;
+                    reverse_tag.value>;
                 int agg_block_dim = cuda::ceil_div(num_tiles, N_READS);
                 agg_block_dim =
                     cuda::ceil_div(agg_block_dim, WARP_SIZE) * WARP_SIZE;
