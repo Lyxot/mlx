@@ -44,6 +44,19 @@ bool supports_qmm_sm80(
     QuantizationMode mode,
     cu::Device& device);
 
+void gather_qmm_sm90(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    cu::CommandEncoder& encoder,
+    Stream s);
+
 void qmm_sm80(
     const array& x,
     const array& w,
@@ -114,12 +127,5 @@ void gather_qmv(
     int group_size,
     QuantizationMode mode,
     cu::CommandEncoder& encoder);
-
-array gather_slices(
-    const array& src,
-    const array& indices,
-    int batch_size,
-    cu::CommandEncoder& encoder,
-    const Stream& s);
 
 } // namespace mlx::core

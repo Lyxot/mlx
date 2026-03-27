@@ -19,6 +19,20 @@ void qmm_impl_sm90(
     int group_size,
     cu::CommandEncoder& encoder,
     Stream s);
+
+template <typename TileShape, typename ClusterShape>
+void gather_qmm_impl_sm90(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    cu::CommandEncoder& encoder,
+    Stream s);
 #endif // defined(MLX_CUDA_SM90A_ENABLED)
 
 bool supports_qmm_sm90(
@@ -94,6 +108,53 @@ void qmm_sm90(
 #else
   throw std::runtime_error(
       "[quantized_matmul] Hopper-only kernel is not available.");
+#endif // defined(MLX_CUDA_SM90A_ENABLED)
+}
+
+void gather_qmm_sm90(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    cu::CommandEncoder& encoder,
+    Stream s) {
+#if defined(MLX_CUDA_SM90A_ENABLED)
+  auto dispatch = [&]<int tile_m, int tile_n, int cluster_m>() {
+    using cute::Int;
+    using TileShapeMN = cute::Shape<Int<tile_m>, Int<tile_n>>;
+    using ClusterShape = cute::Shape<Int<cluster_m>, Int<1>, Int<1>>;
+    gather_qmm_impl_sm90<TileShapeMN, ClusterShape>(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        bits,
+        group_size,
+        encoder,
+        s);
+  };
+  int m = out.shape(-2);
+  if (m <= 16) {
+    dispatch.template operator()<128, 16, 1>();
+  } else if (m <= 32) {
+    dispatch.template operator()<128, 32, 1>();
+  } else if (m <= 64) {
+    dispatch.template operator()<128, 64, 2>();
+  } else if (m <= 128) {
+    dispatch.template operator()<128, 128, 2>();
+  } else {
+    dispatch.template operator()<128, 256, 2>();
+  }
+#else
+  throw std::runtime_error("[gather_qmm] Hopper-only kernel is not available.");
 #endif // defined(MLX_CUDA_SM90A_ENABLED)
 }
 

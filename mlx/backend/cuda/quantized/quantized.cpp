@@ -142,16 +142,22 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   bool can_use_qmv = supports(supports_qmv);
 
   auto call_qmm_sm90 = [&]() {
-    // sm90: pre-gather + qmm
-    array gx = gather_slices(x, lhs_indices, B, encoder, s);
-    array gw = gather_slices(w, rhs_indices, B, encoder, s);
-    array gs = gather_slices(scales, rhs_indices, B, encoder, s);
-    std::optional<array> gb = std::nullopt;
-    if (biases) {
-      gb = gather_slices(*biases, rhs_indices, B, encoder, s);
-    }
+    // sm90: fused gather via CUTLASS kArray mode.
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
-    qmm_sm90(gx, gw, gs, *gb, out, bits_, group_size_, encoder, s);
+    encoder.set_input_array(lhs_indices);
+    encoder.set_input_array(rhs_indices);
+    gather_qmm_sm90(
+        x,
+        w,
+        scales,
+        *biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        bits_,
+        group_size_,
+        encoder,
+        s);
   };
   auto call_qmm_sm80 = [&]() {
     // sm80: fused index lookup in the kernel.
