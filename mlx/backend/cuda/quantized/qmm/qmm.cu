@@ -108,7 +108,9 @@ void qmm_impl_sm80(
     int bits,
     int group_size,
     QuantizationMode mode,
-    cu::CommandEncoder& encoder);
+    cu::CommandEncoder& encoder,
+    const uint32_t* lhs_indices,
+    const uint32_t* rhs_indices);
 
 bool supports_qmm_sm80(
     const array& x,
@@ -157,10 +159,22 @@ void qmm_sm80(
     int bits,
     int group_size,
     QuantizationMode mode,
-    cu::CommandEncoder& encoder) {
+    cu::CommandEncoder& encoder,
+    const uint32_t* lhs_indices,
+    const uint32_t* rhs_indices) {
   auto dispatch = [&]<int TileM>() {
     qmm_impl_sm80<TileM>(
-        x, w, scales, biases, out, bits, group_size, mode, encoder);
+        x,
+        w,
+        scales,
+        biases,
+        out,
+        bits,
+        group_size,
+        mode,
+        encoder,
+        lhs_indices,
+        rhs_indices);
   };
   int m = out.shape(-2);
   if (m <= 16) {
