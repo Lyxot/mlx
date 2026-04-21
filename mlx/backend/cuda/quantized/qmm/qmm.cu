@@ -209,6 +209,20 @@ void qmm_naive_impl(
     QuantizationMode mode,
     cu::CommandEncoder& encoder);
 
+// Defined in qmm_naive.cu.
+template <int TileM, bool KMajor, bool HasKResidue, bool SM80>
+void qmm_sorted_naive_impl(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder);
+
 bool supports_qmm_naive(
     const array& x,
     const array& w,
@@ -275,6 +289,65 @@ void qmm_naive(
     }
   };
   int m = out.ndim() > 1 ? out.shape(-2) : 1;
+  int k = x.shape(-1);
+  bool has_k_residue = k % group_size != 0;
+  bool sm80 = encoder.device().compute_capability_major() >= 8;
+  dispatch_bool(transpose, [&](auto k_major) {
+    dispatch_k(k_major, has_k_residue, [&]<bool HasKResidue>() {
+      dispatch_bool(sm80, [&](auto sm80) {
+        constexpr bool KMajor = k_major.value;
+        constexpr bool SM80 = sm80.value;
+        if (m <= 16) {
+          dispatch.template operator()<16, KMajor, HasKResidue, SM80>();
+        } else if (m <= 32) {
+          dispatch.template operator()<32, KMajor, HasKResidue, SM80>();
+        } else {
+          dispatch.template operator()<64, KMajor, HasKResidue, SM80>();
+        }
+      });
+    });
+  });
+}
+
+void qmm_sorted_naive(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
+    array& out,
+    bool transpose,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder) {
+  auto dispatch = [&]<int TileM, bool KMajor, bool HasKResidue, bool SM80>() {
+    qmm_sorted_naive_impl<TileM, KMajor, HasKResidue, SM80>(
+        x,
+        w,
+        scales,
+        biases,
+        rhs_indices,
+        out,
+        bits,
+        group_size,
+        mode,
+        encoder);
+  };
+  auto dispatch_k = [&](auto k_major, bool has_k_residue, auto&& f) {
+    if constexpr (k_major.value) {
+      if (has_k_residue) {
+        throw std::invalid_argument(
+            "[gather_qmm] K must be multiples of group_size.");
+      }
+      f.template operator()<false>();
+    } else {
+      dispatch_bool(has_k_residue, [&](auto has_k_residue) {
+        f.template operator()<has_k_residue.value>();
+      });
+    }
+  };
+  int m = x.size() / x.shape(-1);
   int k = x.shape(-1);
   bool has_k_residue = k % group_size != 0;
   bool sm80 = encoder.device().compute_capability_major() >= 8;

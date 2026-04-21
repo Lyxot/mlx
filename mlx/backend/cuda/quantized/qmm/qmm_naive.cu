@@ -390,6 +390,265 @@ void qmm_naive(
   launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, smem_bytes, args);
 }
 
+template <bool HasKResidue, typename CtaTiler,
+          typename Element, typename Quant, typename Scale,
+          typename StrideB, typename SmemLayoutA, typename TiledCopyA,
+          typename SmemLayoutB, typename TiledCopyB,
+          typename LayoutS, typename TiledMma>
+__global__ void qmm_sorted_naive_kernel(
+    int M, int N, int K, int E,
+    CtaTiler cta_tiler,
+    const Element* A, SmemLayoutA sA_layout, TiledCopyA copy_a,
+    const Quant*   B, StrideB dB, SmemLayoutB sB_layout, TiledCopyB copy_b,
+          Element* C,
+    const Scale* S, const Element* Z, LayoutS S_layout,
+    const uint32_t* rhs_indices,
+    TiledMma mma) {
+  CUTE_STATIC_ASSERT_V(size(copy_a) == size(mma));
+  CUTE_STATIC_ASSERT_V(size(copy_b) == size(mma));
+
+  int thread_idx = int(threadIdx.x);
+  int m_coord = int(blockIdx.x);
+  int n_coord = int(blockIdx.y);
+
+  int row_start = int(size<0>(cta_tiler)) * m_coord;
+  int tile_m    = int(size<0>(cta_tiler));
+  int tgp_m     = M - row_start;
+  tgp_m = tgp_m < tile_m ? tgp_m : tile_m;
+
+  auto m_max_coord = tgp_m;
+  auto n_max_coord = N - int(size<1>(cta_tiler)) * n_coord;
+
+  auto bK = size<2>(cta_tiler);
+  auto k_residue = K - bK * ceil_div(K, bK);
+  if constexpr (HasKResidue) {
+    A += k_residue;  // stride in K dim = 1
+    B += k_residue * get<1>(dB) * cuda::std::min(8, sizeof_bits_v<Quant>) / 8;
+    S += k_residue * stride<1>(S_layout);
+    if constexpr (quant_has_bias_v<Quant>) {
+      Z += k_residue * stride<1>(S_layout);
+    }
+  }
+
+  // Flat A (M, K) and C (M, N), pre-offset to this block's row range.
+  Tensor mA = make_tensor(make_gmem_ptr(A + row_start * K),
+                          make_shape(tgp_m, K),
+                          make_stride(K, Int<1>{}));
+  Tensor mC = make_tensor(make_gmem_ptr(C + row_start * N),
+                          make_shape(tgp_m, N),
+                          make_stride(N, Int<1>{}));
+  // B: (N, K, E) indexed by expert.
+  Tensor mB_nke = make_tensor(make_gmem_ptr<Quant>(B),
+                              make_shape(N, K, E), dB);
+  Tensor mS_nke = make_tensor(make_gmem_ptr(S), S_layout);
+  Tensor mZ_nke = make_tensor(make_gmem_ptr(Z), S_layout);
+
+  // m starts at 0 within the already-offset A/C tensors.
+  auto cta_coord = make_coord(0, n_coord, _);
+  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{}); // (BLK_M,BLK_K,k)
+  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_N)
+
+  // Shared memory buffers.
+  extern __shared__ char shared_memory[];
+  using SmemStorage = SharedStorage<Element, SmemLayoutA, SmemLayoutB>;
+  SmemStorage& smem = *reinterpret_cast<SmemStorage*>(shared_memory);
+  Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), sA_layout);
+  Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), sB_layout);
+
+  ThrCopy thr_copy_a = copy_a.get_slice(thread_idx);
+  Tensor tAgA = thr_copy_a.partition_S(gA); // (ACPY,ACPY_M,ACPY_K,k)
+  Tensor tAsA = thr_copy_a.partition_D(sA);
+  Tensor tArA = make_fragment_like(tAsA);
+
+  ThrCopy thr_copy_b = copy_b.get_slice(thread_idx);
+  Tensor tBsB = thr_copy_b.partition_D(sB);
+
+  ThrMMA thr_mma = mma.get_slice(thread_idx);
+  Tensor tCsA = thr_mma.partition_A(sA);
+  Tensor tCsB = thr_mma.partition_B(sB);
+  Tensor tCgC = thr_mma.partition_C(gC);
+
+  Tensor tApA = make_tensor<bool>(make_shape(size<1>(tAsA), size<2>(tAsA)), Stride<_1,_0>{});
+  Tensor tBpB = make_tensor<bool>(make_shape(size<1>(tBsB), size<2>(tBsB)), Stride<_1,_0>{});
+  Tensor cA = make_identity_tensor(make_shape(size<0>(sA), size<1>(sA)));
+  Tensor cB = make_identity_tensor(make_shape(size<0>(sB), size<1>(sB)));
+  Tensor cC = make_identity_tensor(make_shape(size<0>(gC), size<1>(gC)));
+  Tensor tAcA = thr_copy_a.partition_S(cA);
+  Tensor tBcB = thr_copy_b.partition_S(cB);
+  Tensor tCcC = thr_mma.partition_C(cC);
+  CUTE_UNROLL
+  for (int m = 0; m < size<0>(tApA); ++m) {
+    tApA(m,0) = get<0>(tAcA(0,m,0)) < m_max_coord;
+  }
+  CUTE_UNROLL
+  for (int n = 0; n < size<0>(tBpB); ++n) {
+    tBpB(n,0) = get<0>(tBcB(0,n,0)) < n_max_coord;
+  }
+
+  // Iterate over consecutive runs of equal rhs_indices within this m-tile.
+  int offset = 0;
+  while (offset < tgp_m) {
+    uint32_t b = rhs_indices[row_start + offset];
+    int offset_next = offset + 1;
+    while (offset_next < tgp_m &&
+           rhs_indices[row_start + offset_next] == b) {
+      offset_next++;
+    }
+
+    Tensor mB = mB_nke(_,_,b);
+    Tensor mS = mS_nke(_,_,b);
+    Tensor mZ = mZ_nke(_,_,b);
+
+    Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{}); // (BLK_N,BLK_K,k)
+    Tensor gS = local_tile(mS, cta_tiler, cta_coord, Step< X,_1,_1>{});
+    Tensor gZ = local_tile(mZ, cta_tiler, cta_coord, Step< X,_1,_1>{});
+
+    Tensor tBgB    = thr_copy_b.partition_S(gB);
+    Tensor tBrB    = make_fragment_like<Quant>(tBsB);
+    Tensor tBrB_dq = make_fragment_like(tBsB);
+    Tensor tBgS    = thr_copy_b.partition_S(gS);
+    Tensor tBrS    = make_fragment_like(tBgS(_,_,_,0));
+    Tensor tBgZ    = thr_copy_b.partition_S(gZ);
+    Tensor tBrZ    = make_fragment_like(tBgZ(_,_,_,0));
+    Tensor tCrC    = thr_mma.make_fragment_C(tCgC);
+
+    auto fetch_gmem = [&](int tile) {
+      copy_if(copy_a, tApA, tAgA(_,_,_,tile), tArA);
+      copy_if(copy_b, tBpB, tBgB(_,_,_,tile), tBrB);
+      copy(tBgS(_,_,_,tile), tBrS);
+      copy(tBgZ(_,_,_,tile), tBrZ);
+    };
+    auto store_smem = [&]() {
+      __syncthreads();
+      copy(tArA, tAsA);
+      CUTE_UNROLL
+      for (int k = 0; k < size<2>(tBrB); ++k) {
+        CUTE_UNROLL
+        for (int n = 0; n < size<1>(tBrB); ++n) {
+          cute_dequant(tBrB(_,n,k), tBrS(_,n,k), tBrZ(_,n,k), tBrB_dq(_,n,k));
+        }
+      }
+      copy(tBrB_dq, tBsB);
+      __syncthreads();
+    };
+
+    if constexpr (HasKResidue) {
+      clear(tArA);
+      clear(tBrB);
+      clear(tBrS);
+      clear(tBrZ);
+      Tensor tAgA_k = tAgA(_,_,_,0);
+      CUTE_UNROLL
+      for (int k = 0; k < size<2>(tArA); ++k) {
+        if (get<1>(tAcA(0,0,k)) >= -k_residue) {
+          copy_if(copy_a, tApA(_,k), tAgA_k(_,_,k), tArA(_,_,k));
+        }
+      }
+      Tensor tBgB_k = tBgB(_,_,_,0);
+      Tensor tBgS_k = tBgS(_,_,_,0);
+      Tensor tBgZ_k = tBgZ(_,_,_,0);
+      CUTE_UNROLL
+      for (int k = 0; k < size<2>(tBrB); ++k) {
+        if (get<1>(tBcB(0,0,k)) >= -k_residue) {
+          copy_if(copy_b, tBpB(_,k), tBgB_k(_,_,k), tBrB(_,_,k));
+          copy(tBgS_k(_,_,k), tBrS(_,_,k));
+          copy(tBgZ_k(_,_,k), tBrZ(_,_,k));
+        }
+      }
+    } else {
+      fetch_gmem(0);
+    }
+
+    clear(tCrC);
+
+    auto K_TILE_MAX = size<3>(tAgA);
+    for (int tile = 0; tile < K_TILE_MAX; ++tile) {
+      store_smem();
+      if constexpr (HasKResidue) {
+        // Avoid fetching full 0th-tile when there is residue.
+        if (K_TILE_MAX > 1) {
+          fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+        }
+      } else {
+        fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+      }
+      gemm(mma, tCsA, tCsB, tCrC);
+    }
+
+    // Store only the rows belonging to this group.
+    CUTE_UNROLL
+    for (int i = 0; i < size(tCrC); ++i) {
+      auto row = get<0>(tCcC(i));
+      if ((row < m_max_coord) && (get<1>(tCcC(i)) < n_max_coord)) {
+        if (row >= offset && row < offset_next) {
+          tCgC(i) = Element(tCrC(i));
+        }
+      }
+    }
+
+    offset = offset_next;
+  }
+}
+
+template <int TileM = 16, bool KMajor = true, bool HasKResidue = false, bool SM80 = true,
+          typename Element, typename Quant, typename Scale>
+void qmm_sorted_naive(
+    const Element* A,
+    const Quant*   B,
+    const Scale*   S,
+    const Element* Z,
+    const uint32_t* rhs_indices,
+    Element* C,
+    int m, int n, int k, int e,
+    auto group_size,
+    auto&& launch_kernel) {
+  // Define B stride and scales layout; e plays the role of the batch dim for B.
+  auto dB = make_matrix_stride<KMajor>(n, k); // (dN,dK,dE)
+  auto S_layout = make_scales_layout<KMajor>(n, k, e, group_size);
+
+  // Define CTA tile sizes (static).
+  auto bM = Int<TileM>{};
+  auto bN = Int<(!SM80 && group_size > 64) ? 64 : 128>{};
+  auto bK = Int<max(64, group_size)>{};
+  auto cta_tiler = make_shape(bM, bN, bK); // (BLK_M,BLK_N,BLK_K)
+
+  // Define MMA.
+  TiledMMA mma = make_tiled_mma<TileM, SM80, Element>();
+  auto num_threads = size(mma);
+
+  // Define the A/B smem layouts (static).
+  auto sA_layout = make_smem_layout(bM, bK);
+  auto sB_layout = make_smem_layout<KMajor>(bN, bK);
+
+  // Atoms.
+  TiledCopy copy_a = make_tiled_copy<Element, true, HasKResidue>(num_threads, bM, bK);
+  TiledCopy copy_b = make_tiled_copy<Quant, KMajor>(num_threads, bN, bK);
+
+  auto* kernel = &qmm_sorted_naive_kernel<
+      HasKResidue, decltype(cta_tiler),
+      Element, Quant, Scale,
+      decltype(dB), decltype(sA_layout), decltype(copy_a),
+      decltype(sB_layout), decltype(copy_b),
+      decltype(S_layout), decltype(mma)>;
+
+  // Set L1 to be SMEM only.
+  size_t smem_bytes = sizeof(SharedStorage<Element, decltype(sA_layout), decltype(sB_layout)>);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+
+  dim3 num_blocks(size(ceil_div(m, bM)), size(ceil_div(n, bN)), 1);
+  dim3 block_dims(num_threads);
+  void* args[] = {
+      &m, &n, &k, &e, &cta_tiler,
+      &A, &sA_layout, &copy_a,
+      &B, &dB, &sB_layout, &copy_b,
+      &C,
+      &S, &Z, &S_layout,
+      &rhs_indices,
+      &mma};
+  launch_kernel(reinterpret_cast<void*>(kernel), num_blocks, block_dims, smem_bytes, args);
+}
+
 } // namespace cutlass_gemm
 
 // clang-format on
@@ -525,6 +784,63 @@ void qmm_naive_impl(
   });
 }
 
+template <int TileM, bool KMajor, bool HasKResidue, bool SM80>
+void qmm_sorted_naive_impl(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder) {
+  const char* tag = "[gather_qmm]";
+  int k = x.shape(-1);
+  int m = x.size() / k;
+  int n = out.shape(-1);
+  int e = w.size() / w.shape(-1) / w.shape(-2);
+
+  dispatch_element_types(out.dtype(), tag, [&]<typename Element>() {
+    dispatch_quant_types<Element>(
+        bits,
+        group_size,
+        mode,
+        tag,
+        [&]<typename Quant, typename Scale, int group_size>() {
+          encoder.set_input_array(x);
+          encoder.set_input_array(w);
+          encoder.set_input_array(scales);
+          if (biases) {
+            encoder.set_input_array(*biases);
+          }
+          encoder.set_input_array(rhs_indices);
+          encoder.set_output_array(out);
+          cutlass_gemm::qmm_sorted_naive<TileM, KMajor, HasKResidue, SM80>(
+              gpu_ptr<Element>(x),
+              gpu_ptr<Quant>(w),
+              gpu_ptr<Scale>(scales),
+              biases ? gpu_ptr<Element>(*biases) : nullptr,
+              gpu_ptr<uint32_t>(rhs_indices),
+              gpu_ptr<Element>(out),
+              m,
+              n,
+              k,
+              e,
+              cute::Int<group_size>{},
+              [&](auto* kernel,
+                  dim3 num_blocks,
+                  dim3 block_dims,
+                  uint32_t smem_bytes,
+                  void** args) {
+                encoder.add_kernel_node_raw(
+                    kernel, num_blocks, block_dims, {}, smem_bytes, args);
+              });
+        });
+  });
+}
+
 // clang-format off
 template void qmm_naive_impl<@TileM@, @KMajor@, @HasKResidue@, @SM80@>(
     const array& x,
@@ -533,6 +849,18 @@ template void qmm_naive_impl<@TileM@, @KMajor@, @HasKResidue@, @SM80@>(
     const std::optional<array>& biases,
     const std::optional<array>& lhs_indices,
     const std::optional<array>& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder);
+
+template void qmm_sorted_naive_impl<@TileM@, @KMajor@, @HasKResidue@, @SM80@>(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
     array& out,
     int bits,
     int group_size,

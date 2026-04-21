@@ -83,6 +83,19 @@ void qmm_naive(
     QuantizationMode mode,
     cu::CommandEncoder& encoder);
 
+void qmm_sorted_naive(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& rhs_indices,
+    array& out,
+    bool transpose,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder);
+
 bool supports_fp_qmv(
     const array& x,
     const array& w,

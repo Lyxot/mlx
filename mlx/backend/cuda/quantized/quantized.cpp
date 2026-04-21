@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
+#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/quantized/qmm/qmm.h"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
@@ -160,6 +161,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int K = x.shape(-1);
   int B = out.size() / (M * N);
+  int E = w.size() / w.shape(-1) / w.shape(-2);
 
   auto supports = [&](auto&& f) {
     return f(
@@ -224,6 +226,52 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder);
   };
+
+  auto broadcast_with_indices = [&](const array& arr) {
+    if (arr.size() / arr.shape(-2) / arr.shape(-1) == rhs_indices.size()) {
+      return ensure_row_contiguous(arr, encoder, s);
+    }
+    auto new_shape = rhs_indices.shape();
+    new_shape.push_back(arr.shape(-2));
+    new_shape.push_back(arr.shape(-1));
+    array new_arr(std::move(new_shape), arr.dtype(), nullptr, {});
+    broadcast(arr, new_arr);
+    return ensure_row_contiguous(new_arr, encoder, s);
+  };
+
+  auto call_qmm_sorted_naive = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+
+    auto x_contiguous = broadcast_with_indices(x);
+    auto w_contiguous = ensure_row_contiguous(w, encoder, s);
+    auto scales_contiguous = ensure_row_contiguous(scales, encoder, s);
+    auto rhs_indices_contiguous =
+        ensure_row_contiguous(rhs_indices, encoder, s);
+    std::optional<array> biases_contiguous;
+    if (biases) {
+      biases_contiguous = ensure_row_contiguous(*biases, encoder, s);
+    }
+
+    qmm_sorted_naive(
+        x_contiguous,
+        w_contiguous,
+        scales_contiguous,
+        biases_contiguous,
+        rhs_indices_contiguous,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+
+  // TODO: Tune thresholds (currently matched to Metal backend).
+  if (can_use_qmm_naive && M == 1 && right_sorted_ && B >= 16 && E > 0 &&
+      B / E >= 4) {
+    call_qmm_sorted_naive();
+    return;
+  }
 
   if (can_use_qmm_sm80) {
     if (can_use_qmv && (M * B < 8)) {
