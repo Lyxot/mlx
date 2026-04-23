@@ -40,6 +40,95 @@ cute_dequant(auto w, auto s, auto z, auto out) {
   }
 }
 
+template <bool HasKResidue,
+          typename TKRes,
+          typename TCopyA, typename TApA, typename TAcA,
+          typename TAgA, typename TArA, typename TAsA,
+          typename TCopyB, typename TBpB, typename TBcB,
+          typename TBgB, typename TBrB, typename TBrBdq, typename TBsB,
+          typename TBgS, typename TBrS, typename TBgZ, typename TBrZ,
+          typename TMma, typename TCsA, typename TCsB, typename TCrC>
+__device__ void qmm_gemm(
+    TKRes k_residue,
+    TCopyA& copy_a, TApA& tApA, TAcA& tAcA,
+    TAgA& tAgA, TArA& tArA, TAsA& tAsA,
+    TCopyB& copy_b, TBpB& tBpB, TBcB& tBcB,
+    TBgB& tBgB, TBrB& tBrB, TBrBdq& tBrB_dq, TBsB& tBsB,
+    TBgS& tBgS, TBrS& tBrS, TBgZ& tBgZ, TBrZ& tBrZ,
+    TMma& mma, TCsA& tCsA, TCsB& tCsB, TCrC& tCrC) {
+  // GMEM => RMEM.
+  auto fetch_gmem = [&](int tile) {
+    copy_if(copy_a, tApA, tAgA(_,_,_,tile), tArA);
+    copy_if(copy_b, tBpB, tBgB(_,_,_,tile), tBrB);
+    copy(tBgS(_,_,_,tile), tBrS);
+    copy(tBgZ(_,_,_,tile), tBrZ);
+  };
+  // RMEM => SMEM.
+  auto store_smem = [&]() {
+    __syncthreads();
+    copy(tArA, tAsA);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tBrB); ++k) {
+      CUTE_UNROLL
+      for (int n = 0; n < size<1>(tBrB); ++n) {
+        cute_dequant(tBrB(_,n,k), tBrS(_,n,k), tBrZ(_,n,k), tBrB_dq(_,n,k));
+      }
+    }
+    copy(tBrB_dq, tBsB);
+    __syncthreads();
+  };
+
+  // Clear the rmem tiles to account for predicated off loads.
+  if constexpr (HasKResidue) {
+    clear(tArA);
+    clear(tBrB);
+    clear(tBrS);
+    clear(tBrZ);
+  }
+
+  // Prefetch first tile.
+  if constexpr (HasKResidue) {
+    Tensor tAgA_k = tAgA(_,_,_,0);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tArA); ++k) {
+      if (get<1>(tAcA(0,0,k)) >= -k_residue) {
+        copy_if(copy_a, tApA(_,k), tAgA_k(_,_,k), tArA(_,_,k));
+      }
+    }
+    Tensor tBgB_k = tBgB(_,_,_,0);
+    Tensor tBgS_k = tBgS(_,_,_,0);
+    Tensor tBgZ_k = tBgZ(_,_,_,0);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(tBrB); ++k) {
+      if (get<1>(tBcB(0,0,k)) >= -k_residue) {
+        copy_if(copy_b, tBpB(_,k), tBgB_k(_,_,k), tBrB(_,_,k));
+        copy(tBgS_k(_,_,k), tBrS(_,_,k));
+        copy(tBgZ_k(_,_,k), tBrZ(_,_,k));
+      }
+    }
+  } else {
+    fetch_gmem(0);
+  }
+
+  // Clear accumulators.
+  clear(tCrC);
+
+  // Loop over CTA tiles.
+  auto K_TILE_MAX = size<3>(tAgA);
+  for (int tile = 0; tile < K_TILE_MAX; ++tile) {
+    store_smem();
+    if constexpr (HasKResidue) {
+      // Avoid fetching full 0th-tile when there is residue.
+      if (K_TILE_MAX > 1) {
+        fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+      }
+    } else {
+      fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
+    }
+    gemm(mma, tCsA, tCsB, tCrC);
+  }
+}
+
 template <bool HasKResidue, typename ProblemShape, typename CtaTiler,
           typename Element, typename Quant, typename Scale,
           typename StrideA, typename SmemLayoutA, typename TiledCopyA,
@@ -153,77 +242,12 @@ __global__ void qmm_naive_kernel(
     tBpB(n,0) = get<0>(tBcB(0,n,0)) < n_max_coord;
   }
 
-  // GMEM => RMEM.
-  auto fetch_gmem = [&](int tile) {
-    copy_if(copy_a, tApA, tAgA(_,_,_,tile), tArA);
-    copy_if(copy_b, tBpB, tBgB(_,_,_,tile), tBrB);
-    copy(tBgS(_,_,_,tile), tBrS);
-    copy(tBgZ(_,_,_,tile), tBrZ);
-  };
-  // RMEM => SMEM.
-  auto store_smem = [&]() {
-    __syncthreads();
-    copy(tArA, tAsA);
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(tBrB); ++k) {
-      CUTE_UNROLL
-      for (int n = 0; n < size<1>(tBrB); ++n) {
-        cute_dequant(tBrB(_,n,k), tBrS(_,n,k), tBrZ(_,n,k), tBrB_dq(_,n,k));
-      }
-    }
-    copy(tBrB_dq, tBsB);
-    __syncthreads();
-  };
-
-  // Clear the rmem tiles to account for predicated off loads.
-  if constexpr (HasKResidue) {
-    clear(tArA);
-    clear(tBrB);
-    clear(tBrS);
-    clear(tBrZ);
-  }
-
-  // Prefetch first tile.
-  if constexpr (HasKResidue) {
-    Tensor tAgA_k = tAgA(_,_,_,0);
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(tArA); ++k) {
-      if (get<1>(tAcA(0,0,k)) >= -k_residue) {
-        copy_if(copy_a, tApA(_,k), tAgA_k(_,_,k), tArA(_,_,k));
-      }
-    }
-    Tensor tBgB_k = tBgB(_,_,_,0);
-    Tensor tBgS_k = tBgS(_,_,_,0);
-    Tensor tBgZ_k = tBgZ(_,_,_,0);
-    CUTE_UNROLL
-    for (int k = 0; k < size<2>(tBrB); ++k) {
-      if (get<1>(tBcB(0,0,k)) >= -k_residue) {
-        copy_if(copy_b, tBpB(_,k), tBgB_k(_,_,k), tBrB(_,_,k));
-        copy(tBgS_k(_,_,k), tBrS(_,_,k));
-        copy(tBgZ_k(_,_,k), tBrZ(_,_,k));
-      }
-    }
-  } else {
-    fetch_gmem(0);
-  }
-
-  // Clear accumulators.
-  clear(tCrC);
-
-  // Loop over CTA tiles.
-  auto K_TILE_MAX = size<3>(tAgA);
-  for (int tile = 0; tile < K_TILE_MAX; ++tile) {
-    store_smem();
-    if constexpr (HasKResidue) {
-      // Avoid fetching full 0th-tile when there is residue.
-      if (K_TILE_MAX > 1) {
-        fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
-      }
-    } else {
-      fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
-    }
-    gemm(mma, tCsA, tCsB, tCrC);
-  }
+  qmm_gemm<HasKResidue>(
+      k_residue,
+      copy_a, tApA, tAcA, tAgA, tArA, tAsA,
+      copy_b, tBpB, tBcB, tBgB, tBrB, tBrB_dq, tBsB,
+      tBgS, tBrS, tBgZ, tBrZ,
+      mma, tCsA, tCsB, tCrC);
 
   // Epilogue.
   CUTE_UNROLL
@@ -512,68 +536,12 @@ __global__ void qmm_sorted_naive_kernel(
     Tensor tBrZ    = make_fragment_like(tBgZ(_,_,_,0));
     Tensor tCrC    = thr_mma.make_fragment_C(tCgC);
 
-    auto fetch_gmem = [&](int tile) {
-      copy_if(copy_a, tApA, tAgA(_,_,_,tile), tArA);
-      copy_if(copy_b, tBpB, tBgB(_,_,_,tile), tBrB);
-      copy(tBgS(_,_,_,tile), tBrS);
-      copy(tBgZ(_,_,_,tile), tBrZ);
-    };
-    auto store_smem = [&]() {
-      __syncthreads();
-      copy(tArA, tAsA);
-      CUTE_UNROLL
-      for (int k = 0; k < size<2>(tBrB); ++k) {
-        CUTE_UNROLL
-        for (int n = 0; n < size<1>(tBrB); ++n) {
-          cute_dequant(tBrB(_,n,k), tBrS(_,n,k), tBrZ(_,n,k), tBrB_dq(_,n,k));
-        }
-      }
-      copy(tBrB_dq, tBsB);
-      __syncthreads();
-    };
-
-    if constexpr (HasKResidue) {
-      clear(tArA);
-      clear(tBrB);
-      clear(tBrS);
-      clear(tBrZ);
-      Tensor tAgA_k = tAgA(_,_,_,0);
-      CUTE_UNROLL
-      for (int k = 0; k < size<2>(tArA); ++k) {
-        if (get<1>(tAcA(0,0,k)) >= -k_residue) {
-          copy_if(copy_a, tApA(_,k), tAgA_k(_,_,k), tArA(_,_,k));
-        }
-      }
-      Tensor tBgB_k = tBgB(_,_,_,0);
-      Tensor tBgS_k = tBgS(_,_,_,0);
-      Tensor tBgZ_k = tBgZ(_,_,_,0);
-      CUTE_UNROLL
-      for (int k = 0; k < size<2>(tBrB); ++k) {
-        if (get<1>(tBcB(0,0,k)) >= -k_residue) {
-          copy_if(copy_b, tBpB(_,k), tBgB_k(_,_,k), tBrB(_,_,k));
-          copy(tBgS_k(_,_,k), tBrS(_,_,k));
-          copy(tBgZ_k(_,_,k), tBrZ(_,_,k));
-        }
-      }
-    } else {
-      fetch_gmem(0);
-    }
-
-    clear(tCrC);
-
-    auto K_TILE_MAX = size<3>(tAgA);
-    for (int tile = 0; tile < K_TILE_MAX; ++tile) {
-      store_smem();
-      if constexpr (HasKResidue) {
-        // Avoid fetching full 0th-tile when there is residue.
-        if (K_TILE_MAX > 1) {
-          fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
-        }
-      } else {
-        fetch_gmem((tile + 1 < K_TILE_MAX) ? tile + 1 : tile);
-      }
-      gemm(mma, tCsA, tCsB, tCrC);
-    }
+    qmm_gemm<HasKResidue>(
+        k_residue,
+        copy_a, tApA, tAcA, tAgA, tArA, tAsA,
+        copy_b, tBpB, tBcB, tBgB, tBrB, tBrB_dq, tBsB,
+        tBgS, tBrS, tBgZ, tBrZ,
+        mma, tCsA, tCsB, tCrC);
 
     // Store only the rows belonging to this group.
     CUTE_UNROLL
