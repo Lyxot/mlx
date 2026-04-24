@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
+#include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/quantized/qmm/qmm.h"
 #include "mlx/backend/cuda/quantized/quantized_utils.h"
@@ -160,6 +161,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int K = x.shape(-1);
   int B = out.size() / (M * N);
+  int E = w.size() / w.shape(-1) / w.shape(-2);
 
   auto supports = [&](auto&& f) {
     return f(
@@ -209,6 +211,31 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder);
   };
+
+  auto call_qmm_naive_rhs = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    array x_contiguous = x;
+    if (x.size() / x.shape(-2) / x.shape(-1) != rhs_indices.size()) {
+      auto new_shape = rhs_indices.shape();
+      new_shape.push_back(x.shape(-2));
+      new_shape.push_back(x.shape(-1));
+      array new_x(std::move(new_shape), x.dtype(), nullptr, {});
+      broadcast(x, new_x);
+      x_contiguous = ensure_row_contiguous(new_x, encoder, s);
+    }
+    gather_qmm_naive_rhs(
+        x_contiguous,
+        w,
+        scales,
+        biases,
+        rhs_indices,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
   auto call_qmv = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     gather_qmv(
@@ -237,6 +264,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (can_use_qmm_naive) {
     if (can_use_qmv && (M * B < 8)) {
       call_qmv();
+    } else if (M == 1 && B >= 32 && right_sorted_ == true && B / E >= 8) {
+      call_qmm_naive_rhs();
     } else {
       call_qmm_naive();
     }
